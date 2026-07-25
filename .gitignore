@@ -1,20 +1,9 @@
-node_modules/
-.claude/
-*.log
-
-# Runtime config ? auto-created next to the extension on first load; user-edited,
+# Runtime config auto-created next to the extension on first load; user-edited,
 # so it must never be tracked (a tracked copy gets clobbered on pi update)
 extensions/loop-police.json
 
-# Tests and playground are local-only (not published, not run in CI):
-# test.mjs + the shared logic/suite it consumes, and the playground HTML shell.
+# Tests and playground, local-only (not published, not run in CI)
 playground.html
+playground.mjs
 test.mjs
-logic.shared.js
-suite.shared.js
 
-# Local working notes, never published
-todo.md
-
-# Local publish script, never published with the extension
-publish.ps1

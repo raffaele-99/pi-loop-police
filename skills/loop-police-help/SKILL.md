@@ -16,12 +16,12 @@ loops in real time before they exhaust your context window.
 - **Semantic loop**: thinking block cycling through the same paragraphs
 - **Output loop**: visible response text repeating the same content verbatim
 - **Output semantic loop**: visible response cycling through the same paragraphs
-- **Stagnation**: thinking across N turns is 85%+ similar (Jaccard)
+- **Stagnation**: thinking across N turns is 85%+ similar; current reasoning is sanitized and the stagnant window is scrubbed from future model context
 - **File read ceiling**: same file read ≥ FILE_SCAN_LIMIT times in total, across all line ranges — only reads that actually ran count (blocked calls don't); identical back-to-back re-reads are the tool call loop's case
 - **Redundant re-read**: ≥ REREAD_RATIO of the last REREAD_WINDOW real reads were re-reads of paths already read and not written/edited since — the model lost track of what it already read
 - **Search spiral**: same pattern searched across ≥ SEARCH_EXPAND_LIMIT paths
 - **Tool call loop**: identical sequence of tool calls repeating
-- **Re-derived reasoning**: right after any detection, the model's thinking re-derives the same reasoning that led to it (≥ REDERIVE_THRESHOLD similar) — that thinking is trimmed from context
+- **Re-derived reasoning**: right after any detection, the model re-derives the same reasoning; the complete signed block is replaced by a signature-free text marker
 - **Consecutive loop**: stream loop aborted N turns in a row (escalated warning)
 
 ## Commands
@@ -53,7 +53,7 @@ loops in real time before they exhaust your context window.
 | `TOOL_LOOP_BAN` | `1` | `0` = off; `1` = block identical call only while repeated back-to-back; `2` = ban that exact call for the rest of the session |
 | `TOOL_LOOP_EXEMPT` | `""` | Comma-separated tool names exempt from the tool call loop detector (case-insensitive exact match, e.g. `bash,run_tests`); exempt calls are never blocked but still break adjacency for other tools |
 | `REDERIVE_THRESHOLD` | `0.85` | After any detection, thinking this Jaccard-similar to the reasoning that led to it is trimmed from context (re-derived reasoning guard) |
-| `HOOK_CMD` | `""` | External command run fire-and-forget on every detection with the JSON payload as its last argument (split on whitespace, no shell — e.g. `node /path/hook.mjs`); observational only, never affects detection |
+| `HOOK_CMD` | `""` | External command per detection; `/set` preserves values such as `node /path/hook.mjs` (execution uses whitespace argv splitting, so paths containing spaces remain unsupported) |
 | `HOOK_TIMEOUT_MS` | `5000` | `HOOK_CMD` is killed after this many ms |
 | `HOOK_LOG` | `""` | Path to a JSONL file; one payload line appended per detection (relative paths resolve against the session cwd) |
 
@@ -89,6 +89,7 @@ settable via `/loop-police set`. `{placeholders}` are filled at runtime:
 ```
 /loop-police set FILE_SCAN_LIMIT=30
 /loop-police set STAGNATION_WINDOW=6 STAGNATION_THRESHOLD=0.9
+/loop-police set HOOK_CMD=node /path/to/hook.mjs
 ```
 
 **Persistent** (survives restarts): edit `loop-police.json` in the extensions directory.

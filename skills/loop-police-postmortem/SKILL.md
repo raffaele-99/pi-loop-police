@@ -72,8 +72,10 @@ surrounding context:
 
 1. **What was the agent doing just before?** (the task, the last few tool
    calls, what it was trying to figure out)
-2. **What exactly repeated?** For thinking loops the repeated tail was
-   deleted from context, so infer it from the surviving prefix and the label.
+2. **What exactly repeated?** For thinking loops the signed reasoning block was
+   removed from model context, so infer it from the surviving marker and nearby
+   transcript. Stagnant windows remain stored for postmortems but the `context`
+   hook scrubs them before later model calls.
    For file/search/tool blocks the path, pattern, or call is in the reason
    string.
 3. **What happened after?** Did the recovery message work (the agent pivoted

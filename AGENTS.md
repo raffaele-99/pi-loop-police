@@ -25,17 +25,19 @@ Keep it that way — do not add npm dependencies or a compile step.
 ## How it works
 
 The extension exports a default function receiving pi's `ExtensionAPI` and wires
-ten detectors into four lifecycle hooks:
+ten detectors into five lifecycle hooks:
 
 | Hook | Detectors |
 |------|-----------|
-| `message_update` (streaming) | character-level + semantic loop, on both the thinking stream and the visible output — `ctx.abort()` on match |
-| `message_end` | truncates the aborted stream and injects the recovery message; cross-turn stagnation (Jaccard over thinking history); re-derived reasoning guard (trims post-detection thinking that re-derives the blocked plan) |
+| `message_update` (streaming) | character-level + semantic loop on Pi's active `contentIndex`, both thinking and visible output — `ctx.abort()` on match |
+| `message_end` | sanitizes signed/aborted reasoning and injects recovery; stagnation; re-derived reasoning guard |
+| `context` | removes reasoning previously marked as doom-loop content from future model requests while preserving the stored transcript |
 | `tool_call` | tool call sequence loop (exact window repetition, checked first), file read ceiling, redundant re-read window, search expansion spiral — `{ block: true }` on match |
 | `agent_start` / `turn_start` | state reset (all state is closure-local per session; only per-stream state resets on `turn_start`) |
 
-On detection, recovery text is either handed back as the blocked tool's result
-(in-place, same turn) or injected via `pi.sendMessage(..., { triggerTurn: true })`.
+Tool-call recovery text is handed back exactly once as the blocked tool's result
+(in-place, same turn). Stream/reasoning recovery uses
+`pi.sendMessage(..., { triggerTurn: true })` because no tool result exists.
 Every detection also fans out a JSON payload to three observer channels
 (`loop-police:detection` bus event, `HOOK_CMD`, `HOOK_LOG`) — see
 `buildDetectionPayload()`. **This payload shape is public API**: external hooks

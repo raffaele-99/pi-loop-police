@@ -109,12 +109,39 @@ const MESSAGE_DEFAULTS = {
 
 const DEFAULTS = { ...NUMERIC_DEFAULTS, ...STRING_DEFAULTS, ...MESSAGE_DEFAULTS };
 
+// Public, immutable snapshot used by tests and the local playground. Detection
+// logic remains in this file; consumers receive data/functions, never a mirror.
+export const LOOP_POLICE_DEFAULTS = Object.freeze({ ...DEFAULTS });
+
 // Stamped into loop-police.json. Files written before 1.5.0 lack it, which is
 // how migrateToolLoopBan() recognizes the old TOOL_LOOP_BAN scale; files
 // stamped below 3 still use the pre-1.8.0 key names (see RENAMED_KEYS); files
 // stamped below 4 still carry the removed same-range file read detector keys
 // (see migrateRemovedKeys).
 const CONFIG_VERSION = 4;
+
+function validatedConfig(fromFile: Record<string, unknown> | null): Record<string, number | string> {
+  if (!fromFile) return {};
+  const out: Record<string, number | string> = {};
+  for (const [key, fallback] of Object.entries(DEFAULTS)) {
+    const value = fromFile[key];
+    if (typeof fallback === "string") {
+      if (typeof value === "string") out[key] = value;
+      continue;
+    }
+    if (typeof value !== "number" || !Number.isFinite(value)) continue;
+    if (["STAGNATION_THRESHOLD", "REREAD_RATIO", "REDERIVE_THRESHOLD"].includes(key)) {
+      if (value >= 0 && value <= 1) out[key] = value;
+      continue;
+    }
+    if (!Number.isInteger(value) || value < 0) continue;
+    if (["MAX_WINDOW", "STRIDE", "PARA_MIN_LEN", "FINGERPRINT_LEN", "HOOK_TIMEOUT_MS"].includes(key) && value === 0)
+      continue;
+    if (key === "TOOL_LOOP_BAN" && value > 2) continue;
+    out[key] = value;
+  }
+  return out;
+}
 
 // 1.8.0 (CONFIG_VERSION 3) renamed the stream-detector keys to conventional
 // terms. migrateRenamedKeys() carries customized values over to the new names;
@@ -137,7 +164,7 @@ const cfg: typeof DEFAULTS & Record<string, number | string> = (() => {
   } catch {
     fromFile = null; // corrupt JSON — leave the file untouched, use defaults
   }
-  const merged = { ...DEFAULTS, ...(fromFile ?? {}) } as typeof DEFAULTS &
+  const merged = { ...DEFAULTS, ...validatedConfig(fromFile) } as typeof DEFAULTS &
     Record<string, number | string>;
 
   // Pre-1.5.0 configs used a shifted TOOL_LOOP_BAN scale (0 = temporary,
@@ -184,13 +211,17 @@ export default function (pi: ExtensionAPI) {
   let cleanStreamPrefix: string | null = null;
   let lastCheckedLen = 0;
   let lastCheckedOutputLen = 0;
+  let lastThinkingContentIndex: number | null = null;
+  let lastOutputContentIndex: number | null = null;
   let loopStream: "thinking" | "output" = "thinking";
   let loopKind: "character" | "semantic" = "character";
+  let loopContentIndex: number | null = null;
   let thinkingSem = newSemanticState();
   let outputSem = newSemanticState();
   let toolHistory: string[] = [];
   let bannedCalls = new Set<string>();
   let thinkingHistory: string[] = [];
+  let taintedThinking = new Set<string>();
   let fileReadTotals = new Map<string, number>(); // path → reads that actually ran, all ranges
   let searchPatternPaths = new Map<string, Set<string>>();
   let rereadSeen = new Set<string>(); // paths read this session, minus those written/edited since
@@ -212,6 +243,8 @@ export default function (pi: ExtensionAPI) {
   function resetStreamState() {
     lastCheckedLen = 0;
     lastCheckedOutputLen = 0;
+    lastThinkingContentIndex = null;
+    lastOutputContentIndex = null;
     thinkingSem = newSemanticState();
     outputSem = newSemanticState();
   }
@@ -222,9 +255,11 @@ export default function (pi: ExtensionAPI) {
     resetStreamState();
     loopStream = "thinking";
     loopKind = "character";
+    loopContentIndex = null;
     toolHistory = [];
     bannedCalls = new Set();
     thinkingHistory = [];
+    taintedThinking = new Set();
     fileReadTotals = new Map();
     searchPatternPaths = new Map();
     rereadSeen = new Set();
@@ -302,6 +337,7 @@ export default function (pi: ExtensionAPI) {
     cleanStreamPrefix = null;
     loopStream = "thinking";
     loopKind = "character";
+    loopContentIndex = null;
     // NOTE: consecutiveLoopCount is intentionally NOT reset here. Recovery
     // turns fire turn_start, so resetting would defeat cross-turn escalation.
     // It is cleared on a clean (non-aborted) turn in message_end instead.
@@ -310,9 +346,10 @@ export default function (pi: ExtensionAPI) {
 
   // Only aborts here; message_end decides which recovery message to send
   // (escalated vs. normal) so a single turn is triggered, not two.
-  function abortStream(cleanPrefix: string, ctx: { abort(): void }) {
+  function abortStream(cleanPrefix: string, contentIndex: number | null, ctx: { abort(): void }) {
     streamAborted = true;
     cleanStreamPrefix = cleanPrefix;
+    loopContentIndex = contentIndex;
     consecutiveLoopCount++;
     ctx.abort();
   }
@@ -323,8 +360,16 @@ export default function (pi: ExtensionAPI) {
 
     // Thinking stream: character-level + semantic
     if (cfg.THINKING_WINDOW > 0 || semanticOn) {
-      const thinking = extractThinking(event.message);
+      const contentIndex = "contentIndex" in event.assistantMessageEvent
+        ? event.assistantMessageEvent.contentIndex
+        : null;
+      const thinking = extractThinkingAt(event.message, contentIndex);
       if (thinking) {
+        if (contentIndex !== lastThinkingContentIndex) {
+          lastThinkingContentIndex = contentIndex;
+          lastCheckedLen = 0;
+          thinkingSem = newSemanticState();
+        }
         // Shrinking text means a new thinking block started streaming (next
         // message in the same turn) — restart this stream's detector state.
         if (thinking.length < lastCheckedLen) {
@@ -343,7 +388,7 @@ export default function (pi: ExtensionAPI) {
           if (repeat) {
             loopStream = "thinking";
             loopKind = kind;
-            return abortStream(repeat.cleanPrefix, ctx);
+            return abortStream(repeat.cleanPrefix, contentIndex, ctx);
           }
         }
       }
@@ -352,8 +397,16 @@ export default function (pi: ExtensionAPI) {
     // Output stream: the same two detectors on the visible response (the last
     // text block streams too — a phrase or paragraph repeating in the answer).
     if (cfg.OUTPUT_WINDOW > 0 || semanticOn) {
-      const output = extractText(event.message);
+      const contentIndex = "contentIndex" in event.assistantMessageEvent
+        ? event.assistantMessageEvent.contentIndex
+        : null;
+      const output = extractTextAt(event.message, contentIndex);
       if (output) {
+        if (contentIndex !== lastOutputContentIndex) {
+          lastOutputContentIndex = contentIndex;
+          lastCheckedOutputLen = 0;
+          outputSem = newSemanticState();
+        }
         if (output.length < lastCheckedOutputLen) {
           lastCheckedOutputLen = 0;
           outputSem = newSemanticState();
@@ -370,7 +423,7 @@ export default function (pi: ExtensionAPI) {
           if (repeat) {
             loopStream = "output";
             loopKind = kind;
-            abortStream(repeat.cleanPrefix, ctx);
+            abortStream(repeat.cleanPrefix, contentIndex, ctx);
           }
         }
       }
@@ -382,8 +435,10 @@ export default function (pi: ExtensionAPI) {
 
     if (streamAborted) {
       const prefix = cleanStreamPrefix ?? "";
+      const contentIndex = loopContentIndex;
       streamAborted = false;
       cleanStreamPrefix = null;
+      loopContentIndex = null;
       resetStreamState();
 
       const label =
@@ -404,8 +459,8 @@ export default function (pi: ExtensionAPI) {
 
       const cleaned =
         loopStream === "output"
-          ? replaceText(event.message, `${prefix}\n\n${label}`)
-          : replaceThinking(event.message, `${prefix}\n\n${label}`);
+          ? replaceTextAt(event.message, contentIndex, `${prefix}\n\n${label}`)
+          : sanitizeThinkingAt(event.message, contentIndex, label);
       emitDetection(
         ctx,
         loopStream === "output"
@@ -422,6 +477,10 @@ export default function (pi: ExtensionAPI) {
       // survived — the clean prefix for thinking loops, the intact thinking
       // block for output loops.
       loopArmed = true;
+      if (loopStream === "thinking") {
+        const original = extractThinkingAt(event.message, contentIndex);
+        if (original) taintedThinking.add(original);
+      }
       const survivor = loopStream === "thinking" ? prefix : extractThinking(event.message);
       if (survivor) lastThinking = survivor;
       pi.sendMessage(
@@ -462,8 +521,9 @@ export default function (pi: ExtensionAPI) {
           { triggerTurn: true }
         );
         return {
-          message: replaceThinking(
+          message: sanitizeThinkingAt(
             event.message,
+            findLastThinkingIndex(event.message),
             "[REDERIVED REASONING — trimmed by loop-police: this conclusion was already reached and led to a detected loop. Do not reconstruct it.]"
           ),
         };
@@ -489,6 +549,7 @@ export default function (pi: ExtensionAPI) {
           (t, i) => i === 0 || jaccard(thinkingHistory[i - 1], t) >= cfg.STAGNATION_THRESHOLD
         );
         if (stagnant) {
+          for (const t of thinkingHistory) taintedThinking.add(t);
           thinkingHistory = [];
           loopArmed = true; // lastThinking (this message) was set above
           emitDetection(ctx, "stagnation", {
@@ -508,10 +569,23 @@ export default function (pi: ExtensionAPI) {
             },
             { triggerTurn: true }
           );
+          return {
+            message: sanitizeThinkingAt(
+              event.message,
+              findLastThinkingIndex(event.message),
+              "[REASONING STAGNATION — repeated reasoning removed by loop-police.]"
+            ),
+          };
         }
       }
     }
   });
+
+  // Keep persisted transcripts available for postmortems, but never replay
+  // reasoning already identified as a doom loop into a future model request.
+  pi.on("context", (event) => ({
+    messages: event.messages.map((message: any) => sanitizeTaintedThinking(message, taintedThinking)),
+  }));
 
   pi.on("tool_call", (event, ctx) => {
     // Tool call sequence loop — checked before the read/search counters below,
@@ -566,15 +640,10 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify(`⚠️ FILE READ CEILING: "${path}" read ${total}x total — blocked`, "warning");
           loopArmed = true;
           emitDetection(ctx, "file_scan_loop", { toolName: event.toolName, path, count: total });
-          pi.sendMessage(
-            {
-              customType: "loop-police",
-              content: withSuffix(fmt(cfg.MSG_FILE_SCAN_LOOP, { path, count: total })),
-              display: true,
-            },
-            { triggerTurn: true }
-          );
-          return { block: true, reason: `loop-police: file read ${total}x total — ${path}` };
+          return {
+            block: true,
+            reason: withSuffix(fmt(cfg.MSG_FILE_SCAN_LOOP, { path, count: total })),
+          };
         }
 
         // Redundant re-read window: the audit failure mode neither counter
@@ -630,26 +699,22 @@ export default function (pi: ExtensionAPI) {
       if (pattern) {
         const searchPath = getInputPath(event.input) ?? "*";
         const paths = searchPatternPaths.get(pattern) ?? new Set<string>();
-        paths.add(searchPath);
-        searchPatternPaths.set(pattern, paths);
-        if (paths.size >= cfg.SEARCH_EXPAND_LIMIT) {
-          ctx.ui.notify(`⚠️ SEARCH SPIRAL: "${pattern}" across ${paths.size} paths — blocked`, "warning");
+        const nextSize = paths.has(searchPath) ? paths.size : paths.size + 1;
+        if (nextSize >= cfg.SEARCH_EXPAND_LIMIT) {
+          ctx.ui.notify(`⚠️ SEARCH SPIRAL: "${pattern}" across ${nextSize} paths — blocked`, "warning");
           loopArmed = true;
           emitDetection(ctx, "search_spiral", {
             toolName: event.toolName,
             pattern,
-            paths: paths.size,
+            paths: nextSize,
           });
-          pi.sendMessage(
-            {
-              customType: "loop-police",
-              content: withSuffix(fmt(cfg.MSG_SEARCH_SPIRAL, { pattern, paths: paths.size })),
-              display: true,
-            },
-            { triggerTurn: true }
-          );
-          return { block: true, reason: `loop-police: search spiral "${pattern}" ×${paths.size} paths` };
+          return {
+            block: true,
+            reason: withSuffix(fmt(cfg.MSG_SEARCH_SPIRAL, { pattern, paths: nextSize })),
+          };
         }
+        paths.add(searchPath);
+        searchPatternPaths.set(pattern, paths);
       }
     }
 
@@ -680,10 +745,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (trimmed.startsWith("set ")) {
-        const results = trimmed
-          .slice(4)
-          .trim()
-          .split(/\s+/)
+        const results = parseConfigAssignments(trimmed.slice(4))
           .map((pair) => setConfigValue(cfg, pair));
         ctx.ui.notify(`Loop Police: ${results.join(", ")} (session only; /loop-police save to persist)`, "info");
         return;
@@ -756,9 +818,26 @@ function setConfigValue(target: Record<string, number | string>, pair: string): 
     return `${key}="${val}"`;
   }
   const num = Number(val);
-  if (val === "" || !Number.isFinite(num)) return `invalid: ${key}=${val}`;
+  if (val === "" || !Number.isFinite(num) || validatedConfig({ [key]: num })[key] === undefined)
+    return `invalid: ${key}=${val}`;
   target[key] = num;
   return `${key}=${num}`;
+}
+
+// Parse KEY=value assignments while allowing whitespace inside string values.
+// A value ends only when the next KEY= assignment begins; matching quotes are
+// removed. This makes `HOOK_CMD=node /path/hook.mjs` work as documented.
+function parseConfigAssignments(input: string): string[] {
+  const matches = [...input.matchAll(/(?:^|\s)([A-Z][A-Z0-9_]*)=/g)];
+  return matches.map((match, i) => {
+    const key = match[1];
+    const start = (match.index ?? 0) + match[0].length;
+    const end = i + 1 < matches.length ? matches[i + 1].index! : input.length;
+    let value = input.slice(start, end).trim();
+    if (value.length >= 2 && ((value[0] === '"' && value.at(-1) === '"') || (value[0] === "'" && value.at(-1) === "'")))
+      value = value.slice(1, -1);
+    return `${key}=${value}`;
+  });
 }
 
 // Returns the TOOL_LOOP_BAN value translated to the ≥1.5.0 scale, or null when
@@ -844,13 +923,33 @@ function getSearchPattern(input: unknown): string | null {
   return inp.pattern ?? inp.query ?? inp.regex ?? inp.search ?? inp.term ?? null;
 }
 
+function findLastThinkingIndex(message: any): number | null {
+  if (!Array.isArray(message?.content)) return null;
+  for (let i = message.content.length - 1; i >= 0; i--)
+    if (message.content[i]?.type === "thinking") return i;
+  return null;
+}
+
+function extractThinkingAt(message: any, index: number | null): string | null {
+  if (index === null || !Array.isArray(message?.content)) return null;
+  const block = message.content[index];
+  return block?.type === "thinking" && typeof block.thinking === "string" ? block.thinking : null;
+}
+
 function extractThinking(message: any): string | null {
   if (!Array.isArray(message?.content)) return null;
-  for (const block of message.content) {
+  for (let i = message.content.length - 1; i >= 0; i--) {
+    const block = message.content[i];
     if (block.type === "thinking" && typeof block.thinking === "string")
       return block.thinking;
   }
   return null;
+}
+
+function extractTextAt(message: any, index: number | null): string | null {
+  if (index === null || !Array.isArray(message?.content)) return null;
+  const block = message.content[index];
+  return block?.type === "text" && typeof block.text === "string" ? block.text : null;
 }
 
 // Output text helpers target the LAST text block: streaming always appends to
@@ -877,15 +976,37 @@ function replaceText(message: any, newText: string): any {
   return { ...message, content };
 }
 
-function replaceThinking(message: any, newText: string): any {
-  if (!Array.isArray(message?.content)) return message;
-  let done = false;
+function replaceTextAt(message: any, index: number | null, newText: string): any {
+  if (index === null || !Array.isArray(message?.content) || message.content[index]?.type !== "text")
+    return replaceText(message, newText);
+  return {
+    ...message,
+    content: message.content.map((block: any, i: number) => i === index ? { ...block, text: newText } : block),
+  };
+}
+
+// Never keep a provider signature attached to modified reasoning. Some
+// providers replay the opaque signed payload (restoring the doom loop), while
+// others reject a signature whose text no longer matches. Replace the entire
+// contaminated block with an ordinary minimal text marker.
+function sanitizeThinkingAt(message: any, index: number | null, marker: string): any {
+  if (index === null || !Array.isArray(message?.content) || message.content[index]?.type !== "thinking")
+    return message;
+  return {
+    ...message,
+    content: message.content.map((block: any, i: number) => i === index ? { type: "text", text: marker } : block),
+  };
+}
+
+function sanitizeTaintedThinking(message: any, tainted: Set<string>): any {
+  if (!Array.isArray(message?.content) || tainted.size === 0) return message;
+  let changed = false;
   const content = message.content.map((block: any) => {
-    if (done || block.type !== "thinking") return block;
-    done = true;
-    return { ...block, thinking: newText };
+    if (block?.type !== "thinking" || !tainted.has(block.thinking)) return block;
+    changed = true;
+    return { type: "text", text: "[DOOM LOOP REASONING — removed from model context by loop-police.]" };
   });
-  return { ...message, content };
+  return changed ? { ...message, content } : message;
 }
 
 // Incremental scan state for detectSemanticLoop: fingerprint counts of the
@@ -906,7 +1027,11 @@ function newSemanticState(): SemanticState {
 // With `state` the scan is incremental across stream checkpoints: paragraphs
 // closed by a blank line are counted once and never re-scanned; the trailing,
 // still-streaming paragraph is re-checked every call but never committed.
-function detectSemanticLoop(text: string, state?: SemanticState): { cleanPrefix: string } | null {
+export function detectSemanticLoop(
+  text: string,
+  state?: SemanticState,
+  config: Record<string, number | string> = cfg
+): { cleanPrefix: string } | null {
   const s = state ?? newSemanticState();
   const delim = /\n\n+/g;
   delim.lastIndex = s.scanned;
@@ -919,10 +1044,10 @@ function detectSemanticLoop(text: string, state?: SemanticState): { cleanPrefix:
     const fenceMarks = (para.match(/```/g) ?? []).length;
     if (!inFence && fenceMarks === 0) {
       const trimmed = para.trim();
-      if (trimmed.length >= cfg.PARA_MIN_LEN) {
-        const key = trimmed.slice(0, cfg.FINGERPRINT_LEN);
+      if (trimmed.length >= Number(config.PARA_MIN_LEN)) {
+        const key = trimmed.slice(0, Number(config.FINGERPRINT_LEN));
         const count = (s.counts.get(key) ?? 0) + 1;
-        if (count >= cfg.SEMANTIC_THRESHOLD) return { cleanPrefix: text.slice(0, pos) };
+        if (count >= Number(config.SEMANTIC_THRESHOLD)) return { cleanPrefix: text.slice(0, pos) };
         if (m) s.counts.set(key, count);
       }
     }
@@ -958,9 +1083,13 @@ function zArray(s: string): Int32Array {
 // it still finds the smallest repeating block. Only the last 2×MAX_WINDOW
 // chars are examined, so MAX_WINDOW caps the size of the repeating block.
 // minWindow is THINKING_WINDOW for thinking, OUTPUT_WINDOW for output text.
-function detectRepeatingSuffix(text: string, minWindow: number): { cleanPrefix: string } | null {
+export function detectRepeatingSuffix(
+  text: string,
+  minWindow: number,
+  config: Record<string, number | string> = cfg
+): { cleanPrefix: string } | null {
   const n = text.length;
-  const maxW = Math.min(cfg.MAX_WINDOW, Math.floor(n / 2));
+  const maxW = Math.min(Number(config.MAX_WINDOW), Math.floor(n / 2));
   if (minWindow <= 0 || maxW < minWindow) return null;
   const tail = text.slice(Math.max(0, n - 2 * maxW));
   const z = zArray(tail.split("").reverse().join(""));
@@ -968,6 +1097,54 @@ function detectRepeatingSuffix(text: string, minWindow: number): { cleanPrefix: 
     if (z[w] >= w) return { cleanPrefix: text.slice(0, n - w) };
   }
   return null;
+}
+
+export type StreamAnalysis = {
+  kind: "thinking" | "output";
+  detector: "character" | "semantic" | null;
+  detectedAt: number | null;
+  cleanPrefix: string;
+  truncated: string;
+  notGenerated: string;
+  checkpoints: number;
+  config: Record<string, number | string>;
+};
+
+// Deterministic replay for tests/playground. It feeds progressively longer
+// prefixes at STRIDE boundaries, matching the extension's incremental checks,
+// and reports the exact context boundary created by an abort.
+export function analyzeStream(
+  text: string,
+  kind: "thinking" | "output",
+  overrides: Record<string, number | string> = {}
+): StreamAnalysis {
+  const config = { ...DEFAULTS, ...validatedConfig(overrides) };
+  const minWindow = Number(kind === "thinking" ? config.THINKING_WINDOW : config.OUTPUT_WINDOW);
+  const semanticOn = Number(config.SEMANTIC_THRESHOLD) > 0;
+  const stride = Number(config.STRIDE);
+  let semantic = newSemanticState();
+  let checkpoints = 0;
+
+  for (let at = stride; at <= text.length; at += stride) {
+    const prefix = text.slice(0, at);
+    if (prefix.length < minWindow * 2 && !semanticOn) continue;
+    checkpoints++;
+    const character = minWindow > 0 ? detectRepeatingSuffix(prefix, minWindow, config) : null;
+    const semanticHit = !character && semanticOn ? detectSemanticLoop(prefix, semantic, config) : null;
+    const hit = character ?? semanticHit;
+    if (hit) return {
+      kind,
+      detector: character ? "character" : "semantic",
+      detectedAt: at,
+      cleanPrefix: hit.cleanPrefix,
+      truncated: prefix.slice(hit.cleanPrefix.length),
+      notGenerated: text.slice(at),
+      checkpoints,
+      config,
+    };
+  }
+
+  return { kind, detector: null, detectedAt: null, cleanPrefix: text, truncated: "", notGenerated: "", checkpoints, config };
 }
 
 function detectSequenceRepeat(history: string[]): number {

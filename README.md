@@ -30,31 +30,31 @@ Ten detectors, all enabled out of the box:
 
 | Detector | Fires when | What happens |
 |----------|-----------|--------------|
-| **Thinking loop** | the thinking block ends in the same ≥ 80 chars twice in a row | stream aborted, repetition truncated, recovery message |
+| **Thinking loop** | the active thinking block ends in the same ≥ 80 chars twice in a row | stream aborted, signed reasoning sanitized, recovery message |
 | **Semantic loop** | the same paragraph appears 3 times in the thinking block | same |
 | **Output loop** | the visible answer ends in the same ≥ 100 chars twice in a row | same |
 | **Output semantic loop** | the same paragraph appears 3 times in the visible answer | same |
-| **Stagnation** | thinking across the last 4 turns is ≥ 85% similar | recovery message |
+| **Stagnation** | thinking across the last 4 turns is ≥ 85% similar | current reasoning sanitized; stagnant window scrubbed from future context |
 | **File read ceiling** | the same file path is read 20 times total (only reads that actually ran count) | tool call blocked |
 | **Redundant re-read** | ≥ 40% of the last 10 reads are re-reads of files unchanged since they were first read | tool call blocked in place |
 | **Search spiral** | the same pattern is searched in 3 different locations | tool call blocked |
 | **Tool call loop** | an identical sequence of tool calls repeats back-to-back | tool call blocked in place |
-| **Re-derived reasoning** | right after any detection, the model's thinking re-derives the same reasoning that led to it (≥ 85% similar) | reasoning trimmed from context, recovery message |
+| **Re-derived reasoning** | right after any detection, the model's thinking re-derives the same reasoning that led to it (≥ 85% similar) | signed reasoning sanitized, recovery message |
 
 ### Streaming loops (thinking and output)
 
-Both streams — the thinking block and the visible response — run the same two detectors as the text arrives, re-checked every 50 new characters (`STRIDE`):
+Both streams — the active block identified by Pi's streaming `contentIndex` — run the same two detectors as the text arrives, re-checked every 50 new characters (`STRIDE`):
 
 - **Character-level**: fires when the text ends in two adjacent, verbatim copies of a block between `THINKING_WINDOW`/`OUTPUT_WINDOW` (80/100) and `MAX_WINDOW` (4000) characters — the model is re-emitting the same content word for word. Detection is a single O(length) pass, so it stays cheap even on very long streams.
 - **Semantic**: every paragraph is fingerprinted by its first `FINGERPRINT_LEN` (60) characters; when the same fingerprint shows up `SEMANTIC_THRESHOLD` (3) times, the model is cycling through the same reasoning even if the wording drifts between passes or other text sits in between. Paragraphs inside ``` code fences are skipped — repeated code structure is legitimate, especially in answers.
 
 The semantic layer is what catches loops early: repeats rarely stay perfectly verbatim, so the character-level check alone can take many extra cycles (or never fire if the repeating unit is huge). With both layers, a loop is typically caught on its third repetition regardless of how the wording mutates.
 
-On detection the stream is aborted immediately, the repeated portion is replaced with a marker — `[THINKING LOOP — truncated by loop-police]`, `[SEMANTIC LOOP — …]`, `[OUTPUT LOOP — …]` or `[SEMANTIC OUTPUT LOOP — …]` — and a recovery message is injected that starts a new turn. If the model loops several turns in a row, the message escalates (`CONSECUTIVE_LOOP_LIMIT`).
+On detection the stream is aborted immediately. Contaminated thinking is replaced by an ordinary text marker with no `thinkingSignature` or redacted payload, preventing providers from replaying opaque reasoning that was supposedly removed. Output text is truncated at the detected boundary. A recovery message starts a new turn; repeated failures escalate through `CONSECUTIVE_LOOP_LIMIT`.
 
 ### Cross-turn stagnation
 
-Some models never loop within a turn but still spin their wheels: each turn's thinking is a light rephrasing of the previous one. After each clean turn the thinking text is stored; when the last `STAGNATION_WINDOW` (4) turns are all ≥ `STAGNATION_THRESHOLD` (85%) word-similar to their neighbor, a recovery message tells the model to change approach.
+Some models never loop within a turn but still spin their wheels: each turn's thinking is a light rephrasing of the previous one. When the last `STAGNATION_WINDOW` (4) turns are all ≥ `STAGNATION_THRESHOLD` (85%) word-similar, the current reasoning is sanitized and a `context` gate removes every reasoning block in that stagnant window from later model requests while leaving the stored transcript available for postmortems.
 
 ### File read ceiling
 
@@ -72,11 +72,11 @@ This deliberately treats *any* re-read of an unchanged file as redundant — inc
 
 ### Search expansion spiral
 
-Tracks how many distinct paths each search pattern (`grep`, `glob`, `find`, …) has been applied to. At `SEARCH_EXPAND_LIMIT` (3) different locations for the same pattern, the call is blocked: the model is widening its search instead of acting on what it already found.
+Tracks how many distinct paths each search pattern (`grep`, `glob`, `find`, …) has been applied to. A call that would reach `SEARCH_EXPAND_LIMIT` (3) locations is blocked in place and is not recorded as an executed search.
 
 ### Tool call sequence loop
 
-Each tool call is hashed (`name` + arguments) into a history, and the extension checks whether the last *W* calls exactly repeat the *W* calls before them — any cycle length, not just single calls. On match, the repeated call is **blocked in place**: it does not run, and the recovery message is handed back as that tool's result in the same turn, so the model must pivot immediately while every *other* tool stays available.
+Each tool call is hashed (`name` + arguments) into a history, and the extension checks whether the last *W* calls exactly repeat the *W* calls before them — any cycle length, not just single calls. On match, the repeated call is **blocked in place**: it does not run, and the recovery message is handed back as that tool's single result. All tool detectors use this one-message path; none adds a duplicate `sendMessage` recovery to context.
 
 Because detection requires *adjacent* repetition, an interleaved different action breaks it: `build → edit → build` never trips, so legitimate re-runs after real changes are fine.
 
@@ -89,7 +89,7 @@ Two knobs adjust this detector:
 
 Blocking an action doesn't remove the reasoning that produced it. Larger models read a block message and pivot; small models re-read their own stale plan in context, arrive at the same conclusion, and try the exact same thing again — block, re-derive, retry, forever.
 
-So after **any** detection fires, the guard watches the model's next message: if its thinking is ≥ `REDERIVE_THRESHOLD` (85%) Jaccard-similar to the reasoning that led to the detection, that thinking is **excised from context** — replaced with `[REDERIVED REASONING — trimmed by loop-police: …]` — and a recovery message tells the model not to reconstruct it and to take a different action, delegate, or ask the user. The guard stays armed after a trim, so re-deriving the same plan again escalates to a `⚠️ STUCK ({count}x)` message instead of cycling silently. Genuinely different reasoning disarms it.
+So after **any** detection fires, the guard watches the model's next message: if its thinking is ≥ `REDERIVE_THRESHOLD` (85%) Jaccard-similar, the entire reasoning block — including any opaque provider signature — is replaced with a minimal ordinary-text marker. A recovery message tells the model not to reconstruct it. The guard stays armed after a trim, so another re-derivation escalates to `⚠️ STUCK ({count}x)`.
 
 This is the fix for the "stuck on reasoning loops" failure mode ([#8](https://github.com/sebaxzero/pi-loop-police/issues/8)): interrupting the *action* is not enough for small models — the reasoning itself has to go.
 
@@ -103,6 +103,8 @@ This is the fix for the "stuck on reasoning loops" failure mode ([#8](https://gi
 ```
 
 Example: `/loop-police set FILE_SCAN_LIMIT=30 STAGNATION_WINDOW=5`
+
+Assignments for string keys may contain spaces until the next `KEY=` token, so `/loop-police set HOOK_CMD=node /path/to/hook.mjs` stores the complete command. Numeric values are range-checked both here and when `loop-police.json` loads; invalid persisted values fall back to the corresponding default.
 
 Changes made with `set` last for the session; `save` persists them to `loop-police.json` (see below).
 
@@ -216,7 +218,7 @@ The payload:
 /loop-police set HOOK_CMD=node /path/to/hook.mjs
 ```
 
-The command runs fire-and-forget on every detection with the JSON payload as its **last argument**, and is killed after `HOOK_TIMEOUT_MS` (5000). It is spawned directly without a shell — the JSON arrives verbatim no matter what it contains, and `HOOK_CMD` is split on whitespace into executable + fixed arguments (so interpreter forms like `python C:\hooks\loop.py` work everywhere; paths containing spaces are not supported). Exit code and output are ignored, but a failing hook shows a one-time warning per session so you notice while developing one.
+The assignment parser preserves `node /path/to/hook.mjs` as one `HOOK_CMD` value. The command runs fire-and-forget on every detection with the JSON payload as its **last argument**, and is killed after `HOOK_TIMEOUT_MS` (5000). It is spawned directly without a shell and then split into executable + fixed arguments; paths containing spaces are not supported. Exit code and output are ignored, but a failing hook shows a one-time warning per session.
 
 Any language works:
 
