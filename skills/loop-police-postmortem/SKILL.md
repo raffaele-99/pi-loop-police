@@ -120,8 +120,10 @@ Evidence patterns for **false positives**, per detector:
 - **Semantic loop** (thinking or output): structured text where paragraphs
   legitimately start identically (numbered checklists, per-file reports,
   table-like blocks) — the first `FINGERPRINT_LEN` chars collide without real
-  repetition. Note that fenced code blocks are already skipped by the
-  detector, so repeated code alone cannot be the cause.
+  repetition. Leading ordered-list counters are normalized before comparison,
+  so distinct numbered items need meaningful text differences within the
+  fingerprint to stay distinct. Note that fenced code blocks are already
+  skipped by the detector, so repeated code alone cannot be the cause.
 - **Character thinking loop**: repeated boilerplate the model quotes
   verbatim more than once (code blocks, error messages, long identifiers) —
   rare at the default 80-char window, plausible below it.

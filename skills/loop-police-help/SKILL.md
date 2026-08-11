@@ -13,9 +13,9 @@ loops in real time before they exhaust your context window.
 ## What it detects
 
 - **Thinking loop**: thinking block repeating the same phrases verbatim
-- **Semantic loop**: thinking block cycling through the same paragraphs
+- **Semantic loop**: thinking block cycling through the same paragraphs; changing leading ordered-list counters are normalized
 - **Output loop**: visible response text repeating the same content verbatim
-- **Output semantic loop**: visible response cycling through the same paragraphs
+- **Output semantic loop**: visible response cycling through the same paragraphs; changing leading ordered-list counters are normalized
 - **Stagnation**: thinking across N turns is 85%+ similar; current reasoning is sanitized and the stagnant window is scrubbed from future model context
 - **File read ceiling**: same file read ≥ FILE_SCAN_LIMIT times in total, across all line ranges — only reads that actually ran count (blocked calls don't); identical back-to-back re-reads are the tool call loop's case
 - **Redundant re-read**: ≥ REREAD_RATIO of the last REREAD_WINDOW real reads were re-reads of paths already read and not written/edited since — the model lost track of what it already read

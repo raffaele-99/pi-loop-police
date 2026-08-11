@@ -1021,9 +1021,11 @@ function newSemanticState(): SemanticState {
 // Semantic loop: paragraphs (blank-line separated) are fingerprinted by their
 // first FINGERPRINT_LEN chars; a fingerprint seen SEMANTIC_THRESHOLD times
 // means the model is cycling through the same content even when wording
-// drifts after the fingerprint or other text sits between repeats. Paragraphs
-// inside (or containing) ``` code fences are skipped — repeated code
-// structure is legitimate, especially in output text.
+// drifts after the fingerprint or other text sits between repeats. A leading
+// ordered-list counter is normalized so monotonically increasing labels such
+// as `23.`, `28.`, `33.` cannot disguise otherwise repeated reasoning.
+// Paragraphs inside (or containing) ``` code fences are skipped — repeated
+// code structure is legitimate, especially in output text.
 // With `state` the scan is incremental across stream checkpoints: paragraphs
 // closed by a blank line are counted once and never re-scanned; the trailing,
 // still-streaming paragraph is re-checked every call but never committed.
@@ -1033,7 +1035,9 @@ export function detectSemanticLoop(
   config: Record<string, number | string> = cfg
 ): { cleanPrefix: string } | null {
   const s = state ?? newSemanticState();
-  const delim = /\n\n+/g;
+  // Provider text may use LF or CRLF; spaces on an otherwise blank line still
+  // delimit paragraphs and must not collapse the whole stream into one block.
+  const delim = /\r?\n[ \t]*\r?\n(?:[ \t]*\r?\n)*/g;
   delim.lastIndex = s.scanned;
   let pos = s.scanned;
   let inFence = s.inFence;
@@ -1045,7 +1049,10 @@ export function detectSemanticLoop(
     if (!inFence && fenceMarks === 0) {
       const trimmed = para.trim();
       if (trimmed.length >= Number(config.PARA_MIN_LEN)) {
-        const key = trimmed.slice(0, Number(config.FINGERPRINT_LEN));
+        // Preserve the list syntax while discarding only its changing ordinal;
+        // numbered and unnumbered prose therefore remain separate fingerprints.
+        const fingerprintText = trimmed.replace(/^\d+([.)])\s+/, "#$1 ");
+        const key = fingerprintText.slice(0, Number(config.FINGERPRINT_LEN));
         const count = (s.counts.get(key) ?? 0) + 1;
         if (count >= Number(config.SEMANTIC_THRESHOLD)) return { cleanPrefix: text.slice(0, pos) };
         if (m) s.counts.set(key, count);

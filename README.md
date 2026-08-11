@@ -46,7 +46,7 @@ Ten detectors, all enabled out of the box:
 Both streams — the active block identified by Pi's streaming `contentIndex` — run the same two detectors as the text arrives, re-checked every 50 new characters (`STRIDE`):
 
 - **Character-level**: fires when the text ends in two adjacent, verbatim copies of a block between `THINKING_WINDOW`/`OUTPUT_WINDOW` (80/100) and `MAX_WINDOW` (4000) characters — the model is re-emitting the same content word for word. Detection is a single O(length) pass, so it stays cheap even on very long streams.
-- **Semantic**: every paragraph is fingerprinted by its first `FINGERPRINT_LEN` (60) characters; when the same fingerprint shows up `SEMANTIC_THRESHOLD` (3) times, the model is cycling through the same reasoning even if the wording drifts between passes or other text sits in between. Paragraphs inside ``` code fences are skipped — repeated code structure is legitimate, especially in answers.
+- **Semantic**: every paragraph is fingerprinted by its first `FINGERPRINT_LEN` (60) characters; a leading ordered-list counter is normalized, so changing labels such as `23.`, `28.`, `33.` cannot disguise repeated reasoning. When the same fingerprint shows up `SEMANTIC_THRESHOLD` (3) times, the model is cycling through the same reasoning even if the wording drifts between passes or other text sits in between. Paragraphs inside ``` code fences are skipped — repeated code structure is legitimate, especially in answers.
 
 The semantic layer is what catches loops early: repeats rarely stay perfectly verbatim, so the character-level check alone can take many extra cycles (or never fire if the repeating unit is huge). With both layers, a loop is typically caught on its third repetition regardless of how the wording mutates.
 
@@ -138,7 +138,7 @@ HOOK_LOG: ""                // JSONL file appended on every detection (see Detec
 Tuning rules of thumb:
 
 - False positives on thinking/output loops → raise `THINKING_WINDOW`/`OUTPUT_WINDOW` (char-level) or `SEMANTIC_THRESHOLD`/`FINGERPRINT_LEN` (semantic).
-- Structured answers with legitimately similar paragraph openings (checklists, per-file reports) → raise `FINGERPRINT_LEN` so fingerprints capture more of each paragraph.
+- Structured answers with legitimately similar paragraph openings (checklists, per-file reports) → raise `FINGERPRINT_LEN` so fingerprints capture more of each paragraph. Leading ordered-list counters are intentionally ignored when comparing fingerprints.
 - Projects where re-reading files is normal → raise `FILE_SCAN_LIMIT` (total per file); monorepos → raise `SEARCH_EXPAND_LIMIT`.
 - Workflows that legitimately re-read unchanged files (huge files paged repeatedly, reference docs consulted often) → raise `REREAD_RATIO` (0.4 → 0.5–0.6) or set `REREAD_WINDOW=0`.
 - Loops caught too late → lower `SEMANTIC_THRESHOLD` to 2 (more sensitive, more false-positive prone).
