@@ -1,101 +1,57 @@
 # AGENTS.md
 
-Guidance for coding agents (and humans) working on **pi-loop-police**, a
-[pi](https://github.com/badlogic/pi-mono) extension that detects and interrupts
-infinite thinking/tool-call loops in real time. `CLAUDE.md` points here — this
-is the single source of truth.
+Rules for **pi-loop-police**, a [pi](https://github.com/badlogic/pi-mono) extension that stops thinking and tool-call loops. `CLAUDE.md` points here.
 
-## Layout
+## Structure
 
-```
-extensions/
-  index.ts           — re-exports the extension (pi's entry point)
-  loop-police.ts     — ALL extension logic, single file, no build step
-  loop-police.json   — persistent config, auto-created from DEFAULTS on first load
-skills/
-  loop-police-help/SKILL.md        — user-facing reference (commands, keys, messages)
-  loop-police-postmortem/SKILL.md  — guided analysis of detections in a session
-examples/hook.mjs    — sample HOOK_CMD script (desktop notification)
-package.json         — pi entry points under "pi": { "extensions", "skills" }
-```
+| Path | Purpose |
+|---|---|
+| `extensions/index.ts` | Pi entry point |
+| `extensions/loop-police.ts` | All wiring and logic |
+| `extensions/loop-police.json` | Auto-created persistent config |
+| `skills/loop-police-help/SKILL.md` | User reference |
+| `skills/loop-police-postmortem/SKILL.md` | Detection analysis |
+| `examples/hook.mjs` | `HOOK_CMD` example |
+| `package.json` | Pi extension/skill entries |
 
-No dependencies, no build: pi loads the `.ts` file directly (type stripping).
-Keep it that way — do not add npm dependencies or a compile step.
+Pi loads TypeScript directly. Add no dependencies or build step.
 
-## How it works
+## Runtime
 
-The extension exports a default function receiving pi's `ExtensionAPI` and wires
-ten detectors into five lifecycle hooks:
+| Hook | Work |
+|---|---|
+| `message_update` | Character and semantic detection on the active thinking/output `contentIndex`; `ctx.abort()` on match |
+| `message_end` | Sanitize signed/aborted reasoning; recover; detect stagnation and re-derived reasoning |
+| `context` | Exclude marked loop reasoning from model context, not the transcript |
+| `tool_call` | In order: repeated tool sequence, file-read ceiling, redundant re-read, search spiral; block on match |
+| `agent_start`, `turn_start` | Reset session/per-stream state respectively |
 
-| Hook | Detectors |
-|------|-----------|
-| `message_update` (streaming) | character-level + semantic loop on Pi's active `contentIndex`, both thinking and visible output — `ctx.abort()` on match |
-| `message_end` | sanitizes signed/aborted reasoning and injects recovery; stagnation; re-derived reasoning guard |
-| `context` | removes reasoning previously marked as doom-loop content from future model requests while preserving the stored transcript |
-| `tool_call` | tool call sequence loop (exact window repetition, checked first), file read ceiling, redundant re-read window, search expansion spiral — `{ block: true }` on match |
-| `agent_start` / `turn_start` | state reset (all state is closure-local per session; only per-stream state resets on `turn_start`) |
+Blocked tools return one in-place recovery result. Stream/reasoning detections use `pi.sendMessage(..., { triggerTurn: true })`.
 
-Tool-call recovery text is handed back exactly once as the blocked tool's result
-(in-place, same turn). Stream/reasoning recovery uses
-`pi.sendMessage(..., { triggerTurn: true })` because no tool result exists.
-Every detection also fans out a JSON payload to three observer channels
-(`loop-police:detection` bus event, `HOOK_CMD`, `HOOK_LOG`) — see
-`buildDetectionPayload()`. **This payload shape is public API**: external hooks
-and other extensions (e.g. pi-input-bar) parse it; never rename its fields or
-existing `event` names.
+Every detection goes through `buildDetectionPayload()` to `loop-police:detection` and configured `HOOK_CMD`/`HOOK_LOG` sinks. Its fields and event names are public API; do not rename them.
 
-Pure logic (detection algorithms, config migration, string helpers) lives at the
-bottom of `loop-police.ts` as plain functions with no pi imports; the wiring
-lives inside the default export. Keep that separation.
+Keep Pi wiring inside the default export. Keep algorithms, migrations, and string helpers below it as plain functions without Pi imports.
 
 ## Config
 
-`loop-police.json` next to the extension file, merged over `DEFAULTS` at load.
-Conventions:
+`loop-police.json` is merged over `DEFAULTS`.
 
-- Numeric keys in `NUMERIC_DEFAULTS`, strings in `STRING_DEFAULTS`, recovery
-  message templates in `MESSAGE_DEFAULTS` (`MSG_*`, with `{placeholder}` tokens
-  filled by `fmt()`).
-- **`0` disables a detector** — every detector must honor its key being 0.
-- New keys are backfilled into existing JSON files automatically (the load IIFE
-  writes the file when defaults are missing) — adding a key needs no migration.
-- Renaming or removing a key DOES need a migration: bump `CONFIG_VERSION` and
-  follow the pattern of `migrateRenamedKeys()` / `migrateRemovedKeys()`
-  (customized values survive, stale defaults pick up the new default).
-- `/loop-police set KEY=VAL` mutates the in-memory config (session-only);
-  `/loop-police save` persists it. `MSG_*` keys are deliberately not settable
-  via `set` — they are edited in the JSON.
+- Put numeric, string, and recovery keys in `NUMERIC_DEFAULTS`, `STRING_DEFAULTS`, and `MESSAGE_DEFAULTS` respectively. Format `{placeholders}` with `fmt()`.
+- Every detector must treat its documented key value `0` as disabled.
+- New defaults are backfilled automatically.
+- For renamed/removed keys, bump `CONFIG_VERSION` and follow `migrateRenamedKeys()`/`migrateRemovedKeys()` so custom values survive and stale defaults update.
+- `/loop-police set` changes session config; `/loop-police save` persists it. `MSG_*` is JSON-only.
 
-## Adding or changing a detector — checklist
+## Detector checklist
 
-1. State as closure variables, cleared in `reset()` (and `turn_start` only if
-   per-turn). Blocked/aborted work must never feed other detectors' counters
-   (e.g. blocked reads don't count toward the file ceiling).
-2. Config key(s) in `NUMERIC_DEFAULTS` with a `0 = off` path, listed in the
-   disable-comment at the top of the file.
-3. Recovery template in `MESSAGE_DEFAULTS`, routed through `withSuffix()`, with
-   placeholders documented in the comment block above `MESSAGE_DEFAULTS`.
-4. `emitDetection(ctx, "<event_name>", details)` on every firing — pick a
-   stable snake_case event name; it becomes public API.
-5. `ctx.ui.notify(...)` warning so the user sees it in the TUI.
-6. Update **all** the docs, they are read independently of each other:
-   - `README.md`: detector count + table, its own section, config listing,
-     disable table, `MSG_*` table, payload `event`/`details` docs.
-   - `skills/loop-police-help/SKILL.md`: detection list, key table, disable
-     line, `MSG_*` table, event list.
-   - `skills/loop-police-postmortem/SKILL.md`: trace-fingerprint table,
-     defaults list, false-positive patterns, recommendation table.
-7. If the detection leaves a marker in the transcript (truncation label, block
-   reason), keep its exact wording stable — the postmortem skill greps for it.
+1. Store state in closures and clear it in `reset()`; clear per-turn state on `turn_start`. Never count blocked/aborted work.
+2. Add numeric keys, `0` handling, and the top-of-file disable comment.
+3. Add a documented `MESSAGE_DEFAULTS` template and pass it through `withSuffix()`.
+4. Call `emitDetection(ctx, "<stable_snake_case_event>", details)` on every firing.
+5. Warn through `ctx.ui.notify(...)`.
+6. Update the detector count/list, config, disable, message, event, postmortem fingerprint, false-positive, and recommendation sections in `README.md` and both skills.
+7. Keep transcript-marker wording stable; postmortems grep it.
 
-## Contributing
+## Contributions
 
-- Issues and PRs at <https://github.com/sebaxzero/pi-loop-police>. For behavior
-  changes, open an issue first describing the failure mode you are targeting —
-  loop detection is heuristic and thresholds are tuned against real sessions.
-- Keep changes surgical: one detector/concern per PR, matching the existing
-  code style (single file, comment-dense around non-obvious invariants).
-- Anything user-visible (keys, messages, events, markers) ships with the doc
-  updates from the checklist above in the same PR.
-- Releases: maintainer bumps `package.json` version, tags `vX.Y.Z`, and
-  `publish.yml` publishes. Do not bump versions in PRs.
+Open behavior-change issues before PRs at <https://github.com/sebaxzero/pi-loop-police>. Keep each PR to one concern, the single-file style, and comments for non-obvious invariants. Ship user-visible code and docs together. Maintainers alone bump versions, tag, and publish.
