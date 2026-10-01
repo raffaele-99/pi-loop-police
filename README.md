@@ -1,6 +1,6 @@
 # pi-loop-police
 
-`pi-loop-police` is a [pi](https://pi.dev) extension that tries to stop models from entering thinking/output/tool-call loops.
+`pi-loop-police` is a [pi](https://pi.dev) extension that tries to stop models from entering thinking/output/tool-call loops. It uses configurable [detectors](docs/DETECTORS.md) to interrupt the current stream or tool call whenever a loop is identified, then attempts to re-orient the agent.
 
 ## Install
 
@@ -10,9 +10,15 @@ pi install [-l] git:github.com/raffaele-99/pi-loop-police.git
 
 ## Use
 
-The "protection" starts in any session where the extension is installed.
+It'll be active in any session where the extension is installed.
 
-> [!NOTE] See [Detectors](docs/DETECTORS.md) for triggers, recovery behavior, and tuning.
+As mentioned above, it triggers automatically based on the detector configuration; you can read more about the configuration options in [this file](docs/CONFIG.md).
+
+> [!NOTE] Detections may add recovery messages to the session context. If configured, [observers](docs/OBSERVERS.md) can also write detection metadata to a JSONL file.
+
+### Commands
+
+Should you want to view or change the active settings mid-session:
 
 | Command | Effect |
 |---|---|
@@ -21,16 +27,15 @@ The "protection" starts in any session where the extension is installed.
 | `/loop-police set KEY=VAL [KEY=VAL …]` | Change session config |
 | `/loop-police save` | Save current config |
 
-String values extend to the next `KEY=` token. Invalid numeric values are rejected or defaulted.
 
-> [!NOTE] See [Configuration](docs/CONFIG.md) for settings and recovery messages, and [Observers](docs/OBSERVERS.md) for integrations.
+### Skills
 
-Two bundled skills provide agent-facing help:
+The extension includes two skills that provide agent-facing help:
 
 - `loop-police-help`: commands, config, and install paths.
 - `loop-police-postmortem`: detection analysis and tuning.
 
-Works with Pi-normalized reasoning, including OpenAI-compatible Qwen and DeepSeek models. [pi-canary](https://github.com/sebaxzero/pi-canary) yields on aborted turns.
+Works with Pi-normalised reasoning, including OpenAI-compatible Qwen and DeepSeek models. [pi-canary](https://github.com/sebaxzero/pi-canary) yields on aborted turns.
 
 ## License
 

@@ -1,6 +1,26 @@
 # Detection observers
 
-Every detection emits metadata, never thinking or tool arguments:
+Every detection produces a small metadata payload. It doesn't include the model's thinking or tool arguments, and observing it can't cancel or change the detection that already happened.
+
+## Available observers
+
+There are three ways to receive the payload:
+
+- `loop-police:detection` is always emitted on Pi's extension event bus. Another extension can subscribe with `pi.events.on("loop-police:detection", handler)`; [`examples/listener-extension.ts`](../examples/listener-extension.ts) and [pi-input-bar](https://github.com/sebaxzero/pi-input-bar) show how.
+- `HOOK_CMD` runs an external command with the JSON payload as its final argument. It runs without a shell and splits arguments on whitespace, so paths containing spaces aren't supported. Output and exit status are ignored, it is stopped after `HOOK_TIMEOUT_MS`, and a failure is only shown once per session. [`examples/hook.mjs`](../examples/hook.mjs) can send an OS notification and, with `LOOP_POLICE_NTFY_TOPIC`, a phone notification.
+- `HOOK_LOG` adds one JSON payload per line to a JSONL file. Relative paths are resolved from the session's working directory.
+
+You can enable both external observers during a session with:
+
+```text
+/loop-police set HOOK_CMD=node /path/to/hook.mjs HOOK_LOG=/path/to/loops.jsonl
+```
+
+Use `/loop-police save` afterwards if you'd like to keep those settings.
+
+## Payload
+
+The payload has this shape:
 
 ```json
 {
@@ -16,9 +36,9 @@ Every detection emits metadata, never thinking or tool arguments:
 }
 ```
 
-`model` may be `null`.
+`model` will be `null` when no model is selected. The contents of `details` depend on the event:
 
-| Event(s) | `details` |
+| Event | Details |
 |---|---|
 | `thinking_loop`, `semantic_loop`, `output_loop`, `output_semantic_loop` | `{ stream, kind, escalated }` |
 | `stagnation` | `{ window, threshold }` |
@@ -27,13 +47,3 @@ Every detection emits metadata, never thinking or tool arguments:
 | `search_spiral` | `{ toolName, pattern, paths }` |
 | `tool_loop` | `{ toolName, windowSize, banned }` |
 | `rederived_reasoning` | `{ streak }` |
-
-Observers cannot alter detection:
-
-- `loop-police:detection`: always-on extension event. Subscribe with `pi.events.on("loop-police:detection", handler)`. See [`examples/listener-extension.ts`](../examples/listener-extension.ts) and [pi-input-bar](https://github.com/sebaxzero/pi-input-bar).
-- `HOOK_CMD`: direct, shell-free, fire-and-forget command receiving payload JSON as its last argument. It uses whitespace splitting, so paths cannot contain spaces; output/status are ignored, timeout uses `HOOK_TIMEOUT_MS`, and failure warns once. See [`examples/hook.mjs`](../examples/hook.mjs), which supports OS notifications and optional `LOOP_POLICE_NTFY_TOPIC` phone pushes.
-- `HOOK_LOG`: one payload per JSONL line; relative paths use session `cwd`.
-
-```text
-/loop-police set HOOK_CMD=node /path/to/hook.mjs HOOK_LOG=/path/to/loops.jsonl
-```
