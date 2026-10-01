@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Rules for **pi-loop-police**, a [pi](https://github.com/badlogic/pi-mono) extension that stops thinking and tool-call loops. `CLAUDE.md` points here.
+Rules for **pi-loop-police**, a [pi](https://github.com/badlogic/pi-mono) extension that stops thinking and tool-call loops.
 
 ## Structure
 
@@ -9,6 +9,9 @@ Rules for **pi-loop-police**, a [pi](https://github.com/badlogic/pi-mono) extens
 | `extensions/index.ts` | Pi entry point |
 | `extensions/loop-police.ts` | All wiring and logic |
 | `extensions/loop-police.json` | Auto-created persistent config |
+| `docs/CONFIG.md` | Keys, messages, and migrations |
+| `docs/DETECTORS.md` | Detector behavior and tuning |
+| `docs/OBSERVERS.md` | Detection payload and sinks |
 | `skills/loop-police-help/SKILL.md` | User reference |
 | `skills/loop-police-postmortem/SKILL.md` | Detection analysis |
 | `examples/hook.mjs` | `HOOK_CMD` example |
@@ -49,7 +52,7 @@ Keep Pi wiring inside the default export. Keep algorithms, migrations, and strin
 3. Add a documented `MESSAGE_DEFAULTS` template and pass it through `withSuffix()`.
 4. Call `emitDetection(ctx, "<stable_snake_case_event>", details)` on every firing.
 5. Warn through `ctx.ui.notify(...)`.
-6. Update the detector count/list, config, disable, message, event, postmortem fingerprint, false-positive, and recommendation sections in `README.md` and both skills.
+6. Update `docs/DETECTORS.md`, `docs/CONFIG.md`, both skills, and `docs/OBSERVERS.md` for payload changes.
 7. Keep transcript-marker wording stable; postmortems grep it.
 
 ## Contributions
